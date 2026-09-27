@@ -1,0 +1,5 @@
+subject,predicate,object
+alice,parent,bob
+alice,parent,carol
+bob,parent,dave
+carol,parent,erin
