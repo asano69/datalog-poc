@@ -1,0 +1,11 @@
+# queries.txt
+#
+# One Mangle query per line. Blank lines and lines starting with "#" are
+# ignored. Loaded by cmd/query/main.go via the -queries flag (default: this
+# file). Override with -queries path/to/other.txt, or pass queries directly
+# as command-line arguments to skip this file entirely for one-off tests.
+
+parent(_, _)
+sibling(_, _)
+ancestor(_, _)
+ancestor("alice", "erin")
