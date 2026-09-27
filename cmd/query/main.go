@@ -21,9 +21,14 @@ import (
 )
 
 // loadTriplesCSV reads a CSV file with header "subject,predicate,object" and
-// adds one fact per row to store. The CSV "predicate" column becomes the
-// Mangle predicate name, so a row like "alice,parent,bob" becomes the fact
-// parent(alice, bob).
+// adds two facts per row to store:
+//   - a fact using the "predicate" column as the Mangle predicate name, so a
+//     row like "alice,parent,bob" becomes parent(alice, bob). This is the
+//     convenient, relation-specific view used by rules like sibling/ancestor.
+//   - a generic triple(Subject, Predicate, Object) fact, e.g.
+//     triple(alice, parent, bob). This lets rules reason across *any*
+//     relation generically (see links2hop in mangle/rules.mg), without
+//     needing to know the relation's name ahead of time.
 func loadTriplesCSV(path string, store factstore.FactStoreWithRemove) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -44,6 +49,8 @@ func loadTriplesCSV(path string, store factstore.FactStoreWithRemove) error {
 		subject, predicate, object := row[0], row[1], row[2]
 		atom := ast.NewAtom(predicate, ast.String(subject), ast.String(object))
 		store.Add(atom)
+		triple := ast.NewAtom("triple", ast.String(subject), ast.String(predicate), ast.String(object))
+		store.Add(triple)
 	}
 	return nil
 }

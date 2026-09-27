@@ -3,3 +3,7 @@ alice,parent,bob
 alice,parent,carol
 bob,parent,dave
 carol,parent,erin
+apple,tag,fruit
+orange,tag,fruit
+banana,tag,fruit
+
