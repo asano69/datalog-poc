@@ -96,12 +96,16 @@ func loadFacts(g *graph, store factstore.FactStoreWithRemove, cardID int) (loade
 	return loaded
 }
 
-// query answers links2hop(cardID, _) from scratch and returns the number of
-// results and the number of facts that had to be loaded.
+// query answers links2hop(cardID, _) from scratch, loading its facts from the
+// in-memory graph, and returns the number of results and loaded facts.
 func query(g *graph, kind string, unit parse.SourceUnit, cardID int) (results, loaded int) {
 	store := newStore(kind)
 	loaded = loadFacts(g, store, cardID)
+	return evaluate(unit, store), loaded
+}
 
+// evaluate runs the links2hop rule over store and returns the result count.
+func evaluate(unit parse.SourceUnit, store factstore.FactStoreWithRemove) int {
 	interp := interpreter.New(io.Discard, ".", nil)
 	if err := interp.Preload([]parse.SourceUnit{unit}, store, map[ast.PredicateSym]ast.Decl{}); err != nil {
 		log.Fatal(err)
@@ -114,16 +118,34 @@ func query(g *graph, kind string, unit parse.SourceUnit, cardID int) (results, l
 	if err != nil {
 		log.Fatal(err)
 	}
-	return len(facts), loaded
+	return len(facts)
+}
+
+// addHub adds one extra card (id n) that count random cards link to, to
+// simulate a popular card whose inbound links grow with the data set.
+func addHub(g *graph, n, count int) (links int) {
+	if count > n {
+		log.Fatalf("-hub %d is larger than -n %d", count, n)
+	}
+	for from := 0; from < count; from++ {
+		g.out[from] = append(g.out[from], n)
+		g.in[n] = append(g.in[n], from)
+		links++
+	}
+	return links
 }
 
 func main() {
 	n := flag.Int("n", 1000, "number of cards")
 	storeKind := flag.String("store", "indexed", "fact store: simple or indexed")
+	hub := flag.Int("hub", 0, "add one card with this many inbound links (0 = none)")
 	flag.Parse()
 
 	rng := rand.New(rand.NewSource(1))
 	g, links := generate(*n, rng)
+	if *hub > 0 {
+		links += addHub(g, *n, *hub)
+	}
 	fmt.Printf("n=%d store=%s links=%d\n", *n, *storeKind, links)
 
 	unit, err := parse.Unit(strings.NewReader(rules))
@@ -143,22 +165,36 @@ func main() {
 		samples = append(samples, rng.Intn(*n))
 	}
 
+	sqlb := newSQLBench(g)
+	defer sqlb.db.Close()
+
+	measure("mangle (memory)", samples, func(id int) (int, int) {
+		return query(g, *storeKind, unit, id)
+	})
+	measure("mangle (sql load)", samples, func(id int) (int, int) {
+		return sqlb.queryMangle(*storeKind, unit, id)
+	})
+	measure("sql join", samples, sqlb.queryJoin)
+}
+
+// measure times run once per sample. samples[0] is the worst-case card, so
+// its time is reported separately. One untimed warm-up call comes first.
+func measure(name string, samples []int, run func(cardID int) (results, loaded int)) {
+	run(samples[0])
+
 	var times []time.Duration
 	totalResults, totalLoaded := 0, 0
 	for _, s := range samples {
 		start := time.Now()
-		results, loaded := query(g, *storeKind, unit, s)
-		elapsed := time.Since(start)
-		times = append(times, elapsed)
+		results, loaded := run(s)
+		times = append(times, time.Since(start))
 		totalResults += results
 		totalLoaded += loaded
-		if s == samples[0] {
-			fmt.Printf("%-12s time=%-10v results=%d facts loaded=%d\n", "worst case", elapsed, results, loaded)
-		}
 	}
 
+	worst := times[0]
 	sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
-	fmt.Printf("%-12s median=%-10v max=%-10v mean results=%d mean facts loaded=%d\n",
-		"per query", times[len(times)/2], times[len(times)-1],
+	fmt.Printf("%-18s worst=%-10v median=%-10v max=%-10v mean results=%d mean facts loaded=%d\n",
+		name, worst, times[len(times)/2], times[len(times)-1],
 		totalResults/len(samples), totalLoaded/len(samples))
 }
