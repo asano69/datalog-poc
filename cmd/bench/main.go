@@ -1,24 +1,19 @@
-// Command bench measures the cost of the links2hop rule on synthetic data.
+// Command bench measures the cost of the links2hop rule on synthetic data,
+// the way the server would run it: for one card, load only the facts the
+// query needs (like two index lookups on card_links), then evaluate the rule
+// over that small set. Nothing is materialized for the whole graph.
 //
 // It generates n cards; each card links to 1-5 other cards (mean 3). A fixed
-// share of the links goes to a small set of "hub" cards (like the "fruit"
-// card), the rest go to uniformly random cards. It then reports:
-//   - the time and heap needed to materialize every rule (Interpreter.Preload)
-//   - the time of a single-card query answered from the materialized result
-//   - the time of the same query computed on demand, without materializing
-//
-// Run one process per (n, store) combination so that heap numbers stay clean.
+// share of the links goes to a small set of "hub" cards (like a popular tag
+// card), the rest go to uniformly random cards.
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
-	"os"
-	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -31,8 +26,24 @@ import (
 
 const (
 	hubShare   = 0.3 // probability that a link targets a hub
-	numSamples = 20  // number of cards used for the single-card queries
+	numSamples = 20  // number of random cards used for the queries
+
+	// rules is parsed once and reused, like the server would do. The card
+	// being asked about is not part of the rule: own holds its link targets
+	// and link holds the other cards pointing to them, so only the result
+	// itself is derived (no all-pairs join).
+	rules = `Decl own(Target).
+Decl link(Source, Target).
+links2hop(B) :- own(X), link(B, X).
+`
 )
+
+// graph stands in for the card_links collection and its two indexes:
+// out is the index on source, in is the index on target.
+type graph struct {
+	out map[int][]int
+	in  map[int][]int
+}
 
 func newStore(kind string) factstore.FactStoreWithRemove {
 	switch kind {
@@ -45,125 +56,57 @@ func newStore(kind string) factstore.FactStoreWithRemove {
 	return nil
 }
 
-// generate adds n cards' links as triple(Card, "link", Target) facts to store
-// and returns the number of links2hop facts the data will produce: a target
-// with in-degree d yields d*(d-1) ordered pairs.
-func generate(n int, store factstore.FactStoreWithRemove, rng *rand.Rand) (links, pairs int) {
+func generate(n int, rng *rand.Rand) (g *graph, links int) {
+	g = &graph{out: map[int][]int{}, in: map[int][]int{}}
+	seen := map[[2]int]bool{}
 	hubs := max(n/100, 1)
-	inDegree := map[int]int{}
 	for from := 0; from < n; from++ {
 		for k := 1 + rng.Intn(5); k > 0; k-- {
 			to := rng.Intn(n)
 			if rng.Float64() < hubShare {
 				to = rng.Intn(hubs)
 			}
-			if to == from {
+			if to == from || seen[[2]int{from, to}] {
 				continue
 			}
-			if store.Add(ast.NewAtom("triple", card(from), ast.String("link"), card(to))) {
-				inDegree[to]++
-				links++
-			}
+			seen[[2]int{from, to}] = true
+			g.out[from] = append(g.out[from], to)
+			g.in[to] = append(g.in[to], from)
+			links++
 		}
 	}
-	for _, d := range inDegree {
-		pairs += d * (d - 1)
-	}
-	return links, pairs
+	return g, links
 }
 
 func card(i int) ast.Constant { return ast.String(fmt.Sprintf("card%d", i)) }
 
-func heapMB() float64 {
-	runtime.GC()
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	return float64(m.HeapAlloc) / 1e6
+// loadFacts adds only the facts links2hop needs for cardID: its own link
+// targets, and every other card that points to one of those targets.
+func loadFacts(g *graph, store factstore.FactStoreWithRemove, cardID int) (loaded int) {
+	for _, target := range g.out[cardID] {
+		if store.Add(ast.NewAtom("own", card(target))) {
+			loaded++
+		}
+		for _, other := range g.in[target] {
+			if other != cardID && store.Add(ast.NewAtom("link", card(other), card(target))) {
+				loaded++
+			}
+		}
+	}
+	return loaded
 }
 
-// timeQueries runs fn for each sample card and prints median/max latency and
-// the mean result count.
-func timeQueries(label string, samples []int, fn func(cardName string) int) {
-	var times []time.Duration
-	total := 0
-	for _, s := range samples {
-		start := time.Now()
-		total += fn(fmt.Sprintf("card%d", s))
-		times = append(times, time.Since(start))
-	}
-	sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
-	fmt.Printf("%-12s median=%-10v max=%-10v mean results=%d\n",
-		label, times[len(times)/2], times[len(times)-1], total/len(samples))
-}
+// query answers links2hop(cardID, _) from scratch and returns the number of
+// results and the number of facts that had to be loaded.
+func query(g *graph, kind string, unit parse.SourceUnit, cardID int) (results, loaded int) {
+	store := newStore(kind)
+	loaded = loadFacts(g, store, cardID)
 
-func main() {
-	n := flag.Int("n", 1000, "number of cards")
-	storeKind := flag.String("store", "indexed", "fact store: simple (as in cmd/query) or indexed")
-	rulesPath := flag.String("rules", "mangle/rules.mg", "path to the Mangle rules file")
-	materialize := flag.Bool("materialize", true, "also measure full materialization (slow and memory hungry for large n)")
-	maxPairs := flag.Int("maxpairs", 20_000_000, "skip the run if links2hop would exceed this many facts")
-	flag.Parse()
-
-	rng := rand.New(rand.NewSource(1))
-	store := newStore(*storeKind)
-	base := heapMB()
-	links, pairs := generate(*n, store, rng)
-	fmt.Printf("n=%d store=%s links=%d expected links2hop facts=%d\n", *n, *storeKind, links, pairs)
-	if pairs > *maxPairs {
-		fmt.Println("skipped: too many links2hop facts")
-		return
-	}
-	fmt.Printf("%-12s heap=%.0f MB\n", "facts only", heapMB()-base)
-
-	samples := make([]int, numSamples)
-	for i := range samples {
-		samples[i] = rng.Intn(*n)
-	}
-
-	// On demand: a per-card rule evaluated over the raw facts. The derived
-	// facts go to a throwaway store layered on top of the shared one.
-	timeQueries("on demand", samples, func(name string) int {
-		src := fmt.Sprintf("Decl triple(S, P, O).\nlinked(B) :- triple(%q, P, X), triple(B, P, X), B != %q.\n", name, name)
-		unit, err := parse.Unit(strings.NewReader(src))
-		if err != nil {
-			log.Fatal(err)
-		}
-		interp := interpreter.New(io.Discard, ".", nil)
-		tee := factstore.NewTeeingStore(store)
-		if err := interp.Preload([]parse.SourceUnit{unit}, tee, map[ast.PredicateSym]ast.Decl{}); err != nil {
-			log.Fatal(err)
-		}
-		return countQuery(interp, "linked(_)")
-	})
-
-	if !*materialize {
-		return
-	}
-
-	// Materialized: evaluate all rules once, then answer from the result.
-	rulesFile, err := os.Open(*rulesPath)
-	if err != nil {
-		log.Fatal(err)
-	}
-	unit, err := parse.Unit(bufio.NewReader(rulesFile))
-	rulesFile.Close()
-	if err != nil {
-		log.Fatal(err)
-	}
 	interp := interpreter.New(io.Discard, ".", nil)
-	start := time.Now()
 	if err := interp.Preload([]parse.SourceUnit{unit}, store, map[ast.PredicateSym]ast.Decl{}); err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("%-12s time=%v heap=%.0f MB (total, incl. facts)\n", "materialize", time.Since(start), heapMB()-base)
-
-	timeQueries("materialized", samples, func(name string) int {
-		return countQuery(interp, fmt.Sprintf("links2hop(%q, _)", name))
-	})
-}
-
-func countQuery(interp *interpreter.Interpreter, q string) int {
-	atom, err := interp.ParseQuery(q)
+	atom, err := interp.ParseQuery("links2hop(_)")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -171,5 +114,51 @@ func countQuery(interp *interpreter.Interpreter, q string) int {
 	if err != nil {
 		log.Fatal(err)
 	}
-	return len(facts)
+	return len(facts), loaded
+}
+
+func main() {
+	n := flag.Int("n", 1000, "number of cards")
+	storeKind := flag.String("store", "indexed", "fact store: simple or indexed")
+	flag.Parse()
+
+	rng := rand.New(rand.NewSource(1))
+	g, links := generate(*n, rng)
+	fmt.Printf("n=%d store=%s links=%d\n", *n, *storeKind, links)
+
+	unit, err := parse.Unit(strings.NewReader(rules))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// The worst case: a card that links to the most popular target.
+	busiest := 0
+	for target, sources := range g.in {
+		if len(sources) > len(g.in[busiest]) {
+			busiest = target
+		}
+	}
+	samples := []int{g.in[busiest][0]}
+	for i := 0; i < numSamples; i++ {
+		samples = append(samples, rng.Intn(*n))
+	}
+
+	var times []time.Duration
+	totalResults, totalLoaded := 0, 0
+	for _, s := range samples {
+		start := time.Now()
+		results, loaded := query(g, *storeKind, unit, s)
+		elapsed := time.Since(start)
+		times = append(times, elapsed)
+		totalResults += results
+		totalLoaded += loaded
+		if s == samples[0] {
+			fmt.Printf("%-12s time=%-10v results=%d facts loaded=%d\n", "worst case", elapsed, results, loaded)
+		}
+	}
+
+	sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
+	fmt.Printf("%-12s median=%-10v max=%-10v mean results=%d mean facts loaded=%d\n",
+		"per query", times[len(times)/2], times[len(times)-1],
+		totalResults/len(samples), totalLoaded/len(samples))
 }
